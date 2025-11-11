@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: ai-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./backend/data:/app/data
+      - ./backend/model_artifacts:/app/model_artifacts
+    ports:
+      - "8000:8000"
+    depends_on:
+      - data_updater
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ai-frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./frontend/src:/usr/src/app/src
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  data_updater:
+   build:
+     context: ./data_updater
+   container_name: ai-data-updater
+   restart: unless-stopped
+   env_file:
+     - .env
+   volumes:
+     - ./backend/data:/app/data
+   command: [ "sh", "-c", "python /app/update_data.py && cron && tail -f /var/log/cron.log" ]
+

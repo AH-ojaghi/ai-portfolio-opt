@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pandas
+numpy
+scikit-learn
+tensorflow>=2.16.0
+PyPortfolioOpt
+python-multipart
+joblib
