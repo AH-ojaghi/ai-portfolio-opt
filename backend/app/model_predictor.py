@@ -111,3 +111,4 @@ class ModelPredictor:
                 errors.append(ticker)
                 
         return predictions, errors
+    
