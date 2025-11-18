@@ -15,6 +15,9 @@ services:
       - "8000:8000"
     depends_on:
       - data_updater
+    environment:
+      - MODEL_ARTIFACTS_DIR=/app/model_artifacts
+      - DATA_DIR=/app/data
 
   frontend:
     build:
@@ -31,13 +34,16 @@ services:
       - backend
 
   data_updater:
-   build:
-     context: ./data_updater
-   container_name: ai-data-updater
-   restart: unless-stopped
-   env_file:
-     - .env
-   volumes:
-     - ./backend/data:/app/data
-   command: [ "sh", "-c", "python /app/update_data.py && cron && tail -f /var/log/cron.log" ]
-
+    build:
+      context: ./data_updater
+    container_name: ai-data-updater
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./backend/data:/app/data
+      - ./backend/model_artifacts:/app/model_artifacts
+    environment:
+      - DATA_DIR=/app/data
+      - MODEL_ARTIFACTS_DIR=/app/model_artifacts
+      - UPDATE_TICKERS=AAPL,MSFT,GOOG,AMZN,META,TSLA,NVDA,JPM,JNJ,V
