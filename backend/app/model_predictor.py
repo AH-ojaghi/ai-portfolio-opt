@@ -5,7 +5,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import logging
-# FIX: Added 'Tuple' to the imports below
+# تغییر مهم: اضافه شدن Tuple به لیست زیر
 from typing import Dict, List, Any, Optional, Tuple 
 from keras.saving import load_model
 from app.core.config import settings
@@ -14,7 +14,7 @@ logger = logging.getLogger("ai-backend")
 
 class ModelPredictor:
     """
-    Manages loading of LSTM models, scalers, and performing predictions.
+    مدیریت بارگذاری مدل‌های LSTM، اسکالرها و انجام پیش‌بینی.
     """
     def __init__(self):
         self.models: Dict[str, Any] = {}
@@ -24,7 +24,7 @@ class ModelPredictor:
         self.window_size: int = settings.WINDOW_SIZE_DEFAULT
 
     def load_artifacts(self):
-        """Loads all models and scalers available in the directory."""
+        """بارگذاری تمام مدل‌ها و اسکالرهای موجود در دایرکتوری."""
         try:
             if settings.FEATURES_FILE.exists():
                 with open(settings.FEATURES_FILE, "r") as f:
@@ -44,7 +44,7 @@ class ModelPredictor:
             logger.error(f"💥 Critical error loading artifacts: {e}")
 
     def _load_single_ticker(self, ticker: str):
-        """Loads model and scaler for a specific ticker."""
+        """بارگذاری مدل و اسکالر برای یک تیکر خاص."""
         model_path = settings.MODELS_DIR / f"{ticker}_model.keras"
         scaler_path = settings.SCALERS_DIR / f"{ticker}_scaler.pkl"
 
@@ -63,29 +63,29 @@ class ModelPredictor:
                 logger.error(f"❌ Failed to load scaler for {ticker}: {e}")
 
     def get_valid_tickers(self, requested: List[str]) -> List[str]:
-        """Returns list of tickers that have both a model and a scaler loaded."""
+        """برگرداندن لیست تیکرهایی که هم مدل و هم اسکالر دارند."""
         return [t for t in requested if t in self.models and t in self.scalers]
 
     def prepare_sequence(self, ticker: str, features_df: pd.DataFrame) -> np.ndarray:
-        """Prepares data sequence for LSTM input."""
+        """آماده‌سازی توالی داده برای ورودی به LSTM."""
         common_features = self.feature_info.get('common_features', [])
         if not common_features:
              raise RuntimeError("Common features configuration missing.")
 
-        # Extract ticker-specific column names
+        # استخراج نام ستون‌های مخصوص تیکر
         ticker_cols = [f"{feat}__{ticker}" for feat in common_features]
         missing = [c for c in ticker_cols if c not in features_df.columns]
         if missing:
             raise ValueError(f"Missing columns for {ticker}: {missing}")
 
-        # Select data
+        # انتخاب داده‌ها
         X_ticker = features_df[ticker_cols].values
         if len(X_ticker) < self.window_size:
             raise ValueError(f"Insufficient data for {ticker}. Need {self.window_size}, got {len(X_ticker)}")
 
         X_recent = X_ticker[-self.window_size:]
         
-        # Scale
+        # مقیاس‌دهی
         scaler = self.scalers[ticker]
         X_scaled = scaler.transform(X_recent)
         
@@ -94,8 +94,8 @@ class ModelPredictor:
 
     def predict_returns(self, tickers: List[str], features_df: pd.DataFrame) -> Tuple[Dict[str, float], List[str]]:
         """
-        Executes prediction for a list of tickers.
-        Returns: (Dictionary of predictions, List of errors encountered)
+        اجرای پیش‌بینی برای لیست تیکرها.
+        خروجی: (دیکشنری پیش‌بینی‌ها، لیست خطاهای رخ داده)
         """
         predictions = {}
         errors = []
@@ -111,4 +111,3 @@ class ModelPredictor:
                 errors.append(ticker)
                 
         return predictions, errors
-    

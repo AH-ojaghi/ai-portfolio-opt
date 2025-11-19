@@ -1,281 +1,220 @@
 import os
+import logging
+import json
 import pandas as pd
+import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
-import json
-import logging
-import numpy as np
+from pathlib import Path
+from typing import List, Optional
+import time 
 
-# --- تنظیمات لاگینگ ---
+# --- پیکربندی لاگینگ ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("MarketDataUpdater")
 
-# --- Environment variables ---
-TICKERS = os.environ.get("UPDATE_TICKERS", "AAPL,MSFT,GOOG,AMZN,META,TSLA,NVDA,JPM,JNJ,V")
-DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
-MODEL_DIR = os.environ.get("MODEL_ARTIFACTS_DIR", "/app/model_artifacts")
-OUTFILE = os.path.join(DATA_DIR, "market_data.csv")
-FEATURES_FILE = os.path.join(MODEL_DIR, "feature_cols.json")
+# --- تنظیمات عمومی ---
+# تاخیر بین هر دانلود برای جلوگیری از Rate Limit را به 3 ثانیه افزایش دادیم.
+DOWNLOAD_DELAY_SECONDS = 10
 
-def get_tickers_from_models():
-    """خواندن تیکرها از فایل feature_cols.json مدل"""
-    try:
-        if os.path.exists(FEATURES_FILE):
-            with open(FEATURES_FILE, 'r') as f:
-                feature_info = json.load(f)
-            tickers = feature_info.get('tickers', [])
-            logger.info(f"📋 Loaded {len(tickers)} tickers from model: {tickers}")
-            return tickers
-    except Exception as e:
-        logger.warning(f"⚠️ Error reading feature file: {e}")
+class MarketDataUpdater:
+    """
+    کلاس مدیریت به‌روزرسانی داده‌های بازار با قابلیت اصلاح فرمت و مدیریت خطا.
+    """
     
-    # Fallback به تیکرهای پیش‌فرض
-    tickers = [t.strip().upper() for t in TICKERS.split(",") if t.strip()]
-    logger.info(f"📋 Using fallback tickers: {tickers}")
-    return tickers
+    def __init__(self):
+        self.base_dir = Path("/app")
+        self.data_dir = Path(os.environ.get("DATA_DIR", self.base_dir / "data"))
+        self.model_dir = Path(os.environ.get("MODEL_ARTIFACTS_DIR", self.base_dir / "model_artifacts"))
+        
+        self.models_subdir = self.model_dir / "models"
+        self.features_file = self.model_dir / "feature_cols.json"
+        self.output_file = self.data_dir / "market_data.csv"
+        
+        # نگاشت نمادهای قدیمی به جدید
+        self.ticker_mapping = {
+            "FB": "META",
+            "TWTR": "TWTR" # مثال
+        }
+        
+        # لیست پیش‌فرض
+        self.fallback_tickers = ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "JPM", "JNJ", "V"]
+        self.history_years = 3
+        self.update_threshold_hours = 6
 
-def clean_price_data(df):
-    """پاکسازی کامل داده‌های قیمت"""
-    try:
-        # حذف ستون‌های اضافی
-        if isinstance(df.columns, pd.MultiIndex):
-            if 'Close' in df.columns:
-                df = df['Close'].copy()
-            elif 'Adj Close' in df.columns:
-                df = df['Adj Close'].copy()
-        
-        # اطمینان از DataFrame بودن
-        if isinstance(df, pd.Series):
-            df = df.to_frame()
-        
-        # تبدیل به عدد
-        df = df.apply(pd.to_numeric, errors='coerce')
-        
-        # حذف ردیف‌های کاملاً خالی
-        df = df.dropna(how='all')
-        
-        # جایگزینی مقادیر نامتناهی
-        df = df.replace([np.inf, -np.inf], np.nan)
-        
-        # پر کردن مقادیر缺失 با روش‌های مختلف
-        df_cleaned = df.ffill().bfill()
-        
-        # اگر هنوز مقادیر NaN وجود دارد، با میانگین پر کن
-        if df_cleaned.isna().any().any():
-            df_cleaned = df_cleaned.fillna(df_cleaned.mean())
-        
-        # حذف ستون‌هایی که هنوز مقادیر نامعتبر دارند
-        valid_columns = []
-        for col in df_cleaned.columns:
-            if df_cleaned[col].notna().all() and np.isfinite(df_cleaned[col]).all():
-                valid_columns.append(col)
-            else:
-                logger.warning(f"🗑️ Removing column {col} due to persistent invalid values")
-        
-        df_final = df_cleaned[valid_columns]
-        
-        logger.info(f"✅ Data cleaning: {len(df.columns)} -> {len(df_final.columns)} valid columns")
-        return df_final
-        
-    except Exception as e:
-        logger.error(f"❌ Error in data cleaning: {e}")
-        raise
+    def _ensure_directories(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
 
-def fetch_and_save():
-    """Fetch daily market data for tickers and save to CSV"""
-    tickers = get_tickers_from_models()
-    
-    if not tickers:
-        logger.error("❌ No tickers available for data update")
-        return False
+    def get_target_tickers(self) -> List[str]:
+        """شناسایی و اصلاح نام نمادها."""
+        tickers = set()
 
-    end = datetime.now()
-    start = end - timedelta(days=1095)  # 3 سال داده برای اطمینان
-    
-    logger.info(f"📥 Fetching {len(tickers)} tickers from {start.date()} to {end.date()}")
+        # 1. اسکن فایل‌های مدل
+        if self.models_subdir.exists():
+            model_files = list(self.models_subdir.glob("*_model.keras"))
+            for p in model_files:
+                ticker_name = p.name.replace("_model.keras", "")
+                # اصلاح نام‌های قدیمی
+                if ticker_name in self.ticker_mapping:
+                    logger.info(f"🔄 Mapping old ticker {ticker_name} to {self.ticker_mapping[ticker_name]}")
+                    ticker_name = self.ticker_mapping[ticker_name]
+                tickers.add(ticker_name)
 
-    all_dfs = []
-    successful_tickers = []
-    failed_tickers = []
+        # 2. خواندن از کانفیگ
+        if not tickers and self.features_file.exists():
+            try:
+                with open(self.features_file, 'r') as f:
+                    data = json.load(f)
+                    raw_tickers = data.get('tickers', [])
+                    # اعمال مپینگ
+                    corrected_tickers = [self.ticker_mapping.get(t, t) for t in raw_tickers]
+                    tickers.update(corrected_tickers)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to read feature file: {e}")
 
-    for t in tickers:
+        # 3. Fallback
+        if not tickers:
+            tickers.update(self.fallback_tickers)
+
+        return sorted(list(tickers))
+
+    def is_update_needed(self) -> bool:
+        if not self.output_file.exists():
+            return True
         try:
-            logger.info(f"🔍 Downloading data for {t}...")
+            file_mod_time = datetime.fromtimestamp(self.output_file.stat().st_mtime)
+            hours_since_mod = (datetime.now() - file_mod_time).total_seconds() / 3600
             
-            df = yf.download(
-                t,
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                progress=False,
-                auto_adjust=True,  # استفاده از قیمت‌های تعدیل شده
-                threads=True,
-            )
+            # خواندن سریع برای اطمینان از سلامت فایل
+            df = pd.read_csv(self.output_file, nrows=2)
+            if df.shape[0] < 1: return True # فایل خالی
 
-            if df.empty:
-                logger.warning(f"⚠️ No data for {t}")
-                failed_tickers.append(t)
-                continue
+            if hours_since_mod < self.update_threshold_hours:
+                logger.info(f"✅ Data is fresh (updated {hours_since_mod:.1f}h ago).")
+                return False
+            return True
+        except Exception:
+            return True
 
-            # بررسی ساختار داده
-            logger.debug(f"📊 {t} columns: {list(df.columns)}")
-            
-            # استخراج قیمت بسته‌شدن
-            if 'Close' in df.columns:
-                price_series = df['Close'].rename(t)
-                all_dfs.append(price_series)
-                successful_tickers.append(t)
-                logger.info(f"✅ {t}: {len(price_series)} days of data (first: {price_series.index[0].date()}, last: {price_series.index[-1].date()})")
-            else:
-                logger.warning(f"⚠️ {t}: No Close column found in {list(df.columns)}")
-                failed_tickers.append(t)
+    def fetch_data(self, tickers: List[str]) -> Optional[pd.DataFrame]:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=self.history_years * 365)
+        
+        logger.info(f"📥 Downloading data for {len(tickers)} tickers individually with a {DOWNLOAD_DELAY_SECONDS}s delay.")
 
-        except Exception as e:
-            logger.error(f"❌ Error fetching {t}: {e}")
-            failed_tickers.append(t)
+        price_data = pd.DataFrame()
+        failed_downloads = []
 
-    if not all_dfs:
-        logger.error("❌ No data downloaded from any ticker")
-        return False
-
-    try:
-        # ادغام تمام داده‌ها
-        logger.info("🔄 Merging data from all tickers...")
-        merged = pd.concat(all_dfs, axis=1)
-        
-        # پاکسازی داده‌ها
-        logger.info("🧹 Cleaning merged data...")
-        cleaned_data = clean_price_data(merged)
-        
-        if cleaned_data.empty:
-            logger.error("❌ No valid data after cleaning")
-            return False
-        
-        # اضافه کردن ستون تاریخ
-        cleaned_data.reset_index(inplace=True)
-        cleaned_data.rename(columns={"index": "Date"}, inplace=True)
-        cleaned_data["Date"] = cleaned_data["Date"].dt.strftime("%Y-%m-%d")
-        
-        # بررسی نهایی داده‌ها
-        logger.info("🔍 Final data validation...")
-        for col in cleaned_data.columns:
-            if col != 'Date':
-                series = cleaned_data[col]
-                if series.isna().any() or not np.isfinite(series).all():
-                    logger.error(f"❌ Column {col} still has invalid values")
-                    return False
-        
-        # ذخیره فایل
-        cleaned_data.to_csv(OUTFILE, index=False)
-        
-        # گزارش نهایی
-        logger.info(f"💾 Successfully saved market data to {OUTFILE}")
-        logger.info(f"   📈 Shape: {cleaned_data.shape}")
-        logger.info(f"   📅 Date range: {cleaned_data['Date'].min()} to {cleaned_data['Date'].max()}")
-        logger.info(f"   ✅ Successful: {len(successful_tickers)} tickers")
-        logger.info(f"   ❌ Failed: {len(failed_tickers)} tickers")
-        
-        if failed_tickers:
-            logger.warning(f"   Failed tickers: {failed_tickers}")
-        
-        # نمایش نمونه‌ای از داده‌ها
-        logger.info("📋 Sample of saved data:")
-        logger.info(f"   Columns: {list(cleaned_data.columns)}")
-        logger.info(f"   First 3 rows dates: {cleaned_data['Date'].head(3).tolist()}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Error processing and saving data: {e}")
-        return False
-
-def check_existing_data():
-    """بررسی داده‌های موجود و به‌روزرسانی در صورت نیاز"""
-    if os.path.exists(OUTFILE):
-        try:
-            existing = pd.read_csv(OUTFILE)
-            if 'Date' in existing.columns:
-                last_date = pd.to_datetime(existing['Date']).max()
-                hours_since_update = (datetime.now() - last_date).total_seconds() / 3600
-                logger.info(f"📅 Last data update: {last_date.date()} ({hours_since_update:.1f} hours ago)")
+        for i, ticker in enumerate(tickers):
+            # اگر در تلاش‌های قبلی دچار Rate Limit شده‌اید، بهتر است کمی بیشتر صبر کنید.
+            if i > 0 and failed_downloads:
+                 time.sleep(DOWNLOAD_DELAY_SECONDS * 1.5) 
+                 
+            try:
+                logger.info(f"[{i+1}/{len(tickers)}] Fetching {ticker}...")
                 
-                if hours_since_update < 6:  # هر 6 ساعت یکبار آپدیت
-                    logger.info("✅ Data is up to date, skipping update")
-                    return False
+                # استفاده از yf.Ticker برای کنترل دقیق‌تر Rate Limit
+                ticker_data = yf.Ticker(ticker)
+                
+                # دریافت تاریخچه با تنظیم auto_adjust=True برای دریافت قیمت‌های تعدیل‌شده
+                # حذف آرگومان 'progress' برای جلوگیری از TypeError در نسخه‌های قدیمی‌تر yfinance
+                df_history = ticker_data.history(
+                    start=start_date, 
+                    end=end_date,
+                    auto_adjust=True, # این ستون 'Adj Close' را مستقیماً به 'Close' تبدیل می‌کند
+                )
+                
+                if df_history.empty:
+                    logger.warning(f"⚠️ No history found for {ticker}.")
+                    failed_downloads.append(ticker)
+                    continue
+                
+                # استخراج فقط ستون Close (که اکنون تعدیل شده است) و تغییر نام به نماد سهم
+                if 'Close' in df_history.columns:
+                    price_data[ticker] = df_history['Close']
+                    logger.info(f"   Successfully fetched {df_history.shape[0]} rows.")
                 else:
-                    logger.info("🔄 Data is outdated, proceeding with update")
-                    return True
-        except Exception as e:
-            logger.warning(f"⚠️ Error reading existing data: {e}")
-    
-    logger.info("🆕 No existing data found, creating new dataset")
-    return True
+                     logger.warning(f"⚠️ 'Close' column not found in history for {ticker}.")
+                     failed_downloads.append(ticker)
 
-def validate_market_data():
-    """اعتبارسنجی داده‌های ذخیره شده"""
-    if not os.path.exists(OUTFILE):
-        logger.error("❌ Market data file does not exist")
-        return False
-    
-    try:
-        df = pd.read_csv(OUTFILE)
+                # مکث بین درخواست‌ها برای احترام به Rate Limit
+                if i < len(tickers) - 1:
+                    time.sleep(DOWNLOAD_DELAY_SECONDS)
+
+            except Exception as e:
+                logger.error(f"❌ Error fetching {ticker}: {type(e).__name__} - {e}")
+                failed_downloads.append(ticker)
+                time.sleep(DOWNLOAD_DELAY_SECONDS * 2) # تاخیر بیشتر بعد از خطا
+
+        if not price_data.empty:
+            logger.info(f"✅ Download completed. Combined prices shape: {price_data.shape}")
         
-        # بررسی ساختار پایه
-        if 'Date' not in df.columns:
-            logger.error("❌ Missing 'Date' column")
-            return False
+        if failed_downloads:
+            logger.warning(f"⚠️ Failed to download: {', '.join(failed_downloads)}")
+            
+        return price_data if not price_data.empty else None
+
+    def clean_and_save(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            logger.error("❌ Cannot save data: DataFrame is empty after fetching.")
+            return
+
+        logger.info("🧹 Cleaning and Formatting...")
         
-        if len(df.columns) < 2:
-            logger.error("❌ No price data columns found")
-            return False
+        # 1. حذف ردیف‌های کاملاً خالی
+        df.dropna(how='all', axis=0, inplace=True)
+
+        # 2. پر کردن مقادیر گم شده (FFILL -> BFILL -> 0)
+        df.ffill(inplace=True)
+        df.bfill(inplace=True)
+        # فقط ستون‌های عددی را با 0 پر می‌کنیم (اگر هنوز NaN باقی مانده باشد)
+        df.fillna(0, inplace=True) 
+
+        # 3. ریست ایندکس برای تبدیل Date به ستون (چون از yf.Ticker استفاده کردیم، Date ایندکس است)
+        df_final = df.reset_index()
         
-        # بررسی تاریخ‌ها
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        if df['Date'].isna().any():
-            logger.error("❌ Invalid dates found")
-            return False
+        # 4. اطمینان از نام درست ستون تاریخ
+        if 'Date' not in df_final.columns and df_final.index.name == 'Date':
+             df_final = df_final.reset_index()
         
-        # بررسی داده‌های قیمت
-        price_columns = [col for col in df.columns if col != 'Date']
-        for col in price_columns:
-            series = df[col]
-            if series.isna().any():
-                logger.error(f"❌ NaN values found in {col}")
-                return False
-            if not np.isfinite(series).all():
-                logger.error(f"❌ Non-finite values found in {col}")
-                return False
-            if (series <= 0).any():
-                logger.error(f"❌ Non-positive values found in {col}")
-                return False
+        # 5. فرمت‌دهی تاریخ (بسیار مهم برای حذف ساعت و دقیقه)
+        if 'Date' in df_final.columns:
+            # مطمئن شدن که Date به عنوان datetime شناخته می‌شود
+            df_final['Date'] = pd.to_datetime(df_final['Date']).dt.strftime('%Y-%m-%d')
+
+        # 6. حذف ستون‌های اضافی و اطمینان از تمیز بودن هدر
+        df_final.columns.name = None 
         
-        logger.info(f"✅ Market data validation passed: {len(price_columns)} tickers, {len(df)} rows")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Market data validation failed: {e}")
-        return False
+        try:
+            self.output_file.parent.mkdir(parents=True, exist_ok=True)
+            df_final.to_csv(self.output_file, index=False)
+            
+            # اعتبارسنجی سریع فایل ذخیره شده
+            check = pd.read_csv(self.output_file)
+            logger.info(f"💾 Saved {self.output_file}. Rows: {check.shape[0]}, Columns: {list(check.columns)}")
+            
+            # چک کردن هدر تکراری (این چک اکنون کمتر مورد نیاز است اما حفظ می‌شود)
+            if check.iloc[0,0] == 'Date' or check.iloc[0,1] == check.columns[1]:
+                logger.warning("⚠️ Warning: Possible double header detected! Attempting deep clean...")
+                check = pd.read_csv(self.output_file, skiprows=1)
+                check.to_csv(self.output_file, index=False)
+                logger.info("✅ Double header fixed.")
+
+        except Exception as e:
+            logger.error(f"❌ Save error: {e}")
+
+    def run(self):
+        self._ensure_directories()
+        if self.is_update_needed():
+            tickers = self.get_target_tickers()
+            df = self.fetch_data(tickers)
+            self.clean_and_save(df)
+        else:
+            logger.info("⏭️ Update skipped.")
 
 if __name__ == "__main__":
-    try:
-        logger.info("🚀 Starting data update check...")
-        
-        if check_existing_data():
-            logger.info("🔄 Data update required, starting fetch...")
-            success = fetch_and_save()
-            if success:
-                logger.info("✅ Data update completed successfully")
-                # اعتبارسنجی داده‌های ذخیره شده
-                if validate_market_data():
-                    logger.info("🎉 Data is ready for use!")
-                else:
-                    logger.error("💥 Data validation failed!")
-            else:
-                logger.error("💥 Data update failed")
-        else:
-            logger.info("⏭️ No update needed at this time")
-            
-    except Exception as e:
-        logger.error(f"💥 Data updater error: {e}")
+    MarketDataUpdater().run()

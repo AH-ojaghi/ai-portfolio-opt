@@ -64,31 +64,31 @@ class DataHandler:
 
     def create_advanced_features(self, prices_df: pd.DataFrame, rets_df: pd.DataFrame, windows: List[int] = [5, 10, 20]) -> pd.DataFrame:
         """
-        ایجاد ویژگی‌های پیشرفته تکنیکال (MA, RSI, Momentum, etc).
+        ایجاد ویژگی‌های پیشرفته تکنیکال (MA, RSI, Momentum, Rank).
         """
         features = {}
         rets_local = rets_df.copy()
         prices_local = prices_df.copy()
 
-        # ویژگی‌های بازده (Return Features)
+        # 1. ویژگی‌های بازده (Return Features)
         for w in windows:
             features[f'ret_ma_{w}'] = rets_local.rolling(w, min_periods=1).mean()
             features[f'ret_std_{w}'] = rets_local.rolling(w, min_periods=1).std()
             features[f'ret_skew_{w}'] = rets_local.rolling(w, min_periods=w).skew().fillna(0)
             features[f'ret_kurt_{w}'] = rets_local.rolling(w, min_periods=w).kurt().fillna(0)
 
-        # ویژگی‌های قیمت (Price Features)
+        # 2. ویژگی‌های قیمت (Price Features)
         for w in windows:
             if w > 5:
                 rolling_mean = prices_local.rolling(w, min_periods=1).mean()
                 features[f'price_ma_ratio_{w}'] = prices_local / rolling_mean.replace(0, 1e-10)
 
-        # مومنتوم
+        # 3. مومنتوم (Momentum)
         for w in [10, 20]:
             shifted = prices_local.shift(w).replace(0, 1e-10)
             features[f'momentum_{w}'] = prices_local / shifted - 1
 
-        # RSI
+        # 4. شاخص قدرت نسبی (RSI)
         delta = rets_local.diff()
         for w in [14]:
             gain = (delta.where(delta > 0, 0)).rolling(window=w).mean()
@@ -96,16 +96,27 @@ class DataHandler:
             rs = gain / loss.replace(0, 1e-10)
             features[f'rsi_{w}'] = 100 - (100 / (1 + rs))
 
+        # 5. رتبه‌بندی مومنتوم (Momentum Rank) - بخش حیاتی که گم شده بود
+        # محاسبه میانگین بازده ۲۰ روزه و رتبه‌بندی سهم‌ها نسبت به هم در هر روز
+        mom20 = rets_local.rolling(20, min_periods=1).mean()
+        features["rank_mom20"] = mom20.rank(axis=1, pct=True)
+
         # ترکیب ویژگی‌ها و نام‌گذاری صحیح ستون‌ها
         feature_dfs = []
         for name, feature_data in features.items():
             if isinstance(feature_data, pd.DataFrame):
                 feature_data.columns = [f"{name}__{col}" for col in feature_data.columns]
                 feature_dfs.append(feature_data)
+            elif isinstance(feature_data, pd.Series):
+                 feature_data = feature_data.to_frame()
+                 feature_data.columns = [f"{name}__{col}" for col in feature_data.columns]
+                 feature_dfs.append(feature_data)
 
         all_features = pd.concat(feature_dfs, axis=1)
+        
+        # پر کردن مقادیر خالی ناشی از Rolling
         all_features = all_features.ffill().bfill().fillna(0)
 
-        # حذف واریانس صفر
+        # حذف ستون‌های با واریانس صفر (اطلاعات بی‌استفاده)
         nonzero_variance = all_features.columns[all_features.std() > 1e-6]
         return all_features[nonzero_variance]
